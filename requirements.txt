@@ -1,0 +1,13 @@
+python-dotenv
+openai
+langsmith
+langchain
+pandas
+streamlit
+matplotlib
+prometheus-client
+uvicorn
+fastapi
+python-json-logger
+psutil
+tqdm
