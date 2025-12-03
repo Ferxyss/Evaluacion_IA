@@ -1,74 +1,107 @@
-import time
 import uuid
 import json
-import os
-from pythonjsonlogger import jsonlogger
 import logging
-from dotenv import load_dotenv
-from prometheus_client import Counter, Histogram, Gauge
-
-load_dotenv()
-
-LOG_PATH = os.getenv("LOG_PATH", "logs/agent.log")
-os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+import time
+from typing import Optional, Dict
+from fastapi import FastAPI, Response
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
 
-REQUEST_LATENCY = Histogram("agent_request_latency_seconds", "Latency of agent requests")
-REQUEST_COUNT = Counter("agent_requests_total", "Total agent requests", ['status'])
-TOKENS_USED = Counter("agent_tokens_used_total", "Total tokens used")
-
-logger = logging.getLogger("agent_logger")
+logger = logging.getLogger("agente_logger")
 logger.setLevel(logging.INFO)
+
 if not logger.handlers:
-    handler = logging.FileHandler(LOG_PATH)
-    formatter = jsonlogger.JsonFormatter('%(asctime)s %(levelname)s %(trace_id)s %(span_id)s %(parent_span_id)s %(message)s %(role)s %(latency_ms)s %(tokens_used)s')
-    handler.setFormatter(formatter)
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter('%(message)s'))
     logger.addHandler(handler)
 
-def new_trace_id():
-    return str(uuid.uuid4())
 
-def new_span_id():
-    return str(uuid.uuid4())[:8]
+SOLICITUDES_TOTAL = Counter(
+    'agente_solicitudes_total',
+    'Cantidad total de solicitudes del agente',
+    ['metodo', 'endpoint', 'estado']
+)
 
-def log_event(trace_id, span_id, parent_span_id, role, message, latency_ms=None, tokens_used=None, tool=None, extra=None):
-    record = {
+LATENCIA_SOLICITUD = Histogram(
+    'agente_latencia_s',
+    'Latencia de las solicitudes en segundos',
+    ['endpoint']
+)
+
+TOKENS_USADOS = Counter(
+    'agente_tokens_usados_total',
+    'Cantidad de tokens usados por rol',
+    ['rol']
+)
+
+ERRORES = Counter(
+    'agente_errores_total',
+    'Errores totales por endpoint y tipo',
+    ['endpoint', 'tipo_error']
+)
+
+
+metrics_app = FastAPI()
+
+@metrics_app.get("/metrics")
+def obtener_metricas():
+    """Endpoint para exponer métricas Prometheus."""
+    contenido = generate_latest()
+    return Response(content=contenido, media_type=CONTENT_TYPE_LATEST)
+
+def log_event(
+    rol: str,
+    mensaje: str,
+    latency_ms: Optional[float] = None,
+    tokens: Optional[int] = None,
+    modelo: str = "gpt-4o",
+    extra: Optional[Dict] = None,
+    trace_id: Optional[str] = None,
+    estado: str = "ok",
+    error: Optional[str] = None
+) -> str:
+    """
+    Registra un evento JSON estructurado y retorna el trace_id.
+    """
+    if trace_id is None:
+        trace_id = str(uuid.uuid4())
+
+    evento = {
         "trace_id": trace_id,
-        "span_id": span_id,
-        "parent_span_id": parent_span_id,
-        "role": role,
-        "message": message,
-        "tool": tool,
-        "latency_ms": latency_ms,
-        "tokens_used": tokens_used
+        "rol": rol,
+        "mensaje": mensaje,
+        "latencia_ms": latency_ms,
+        "tokens": tokens,
+        "modelo": modelo,
+        "estado": estado,
+        "error": error,
+        "timestamp": int(time.time() * 1000)
     }
-  
-    logger.info(json.dumps(record), extra={
-        "trace_id": trace_id,
-        "span_id": span_id,
-        "parent_span_id": parent_span_id,
-        "role": role,
-        "latency_ms": latency_ms or 0,
-        "tokens_used": tokens_used or 0
-    })
 
-def instrument(fn):
-    def wrapper(*args, **kwargs):
-        trace_id = kwargs.get("trace_id") or new_trace_id()
-        parent_span_id = kwargs.get("parent_span_id")
-        span_id = new_span_id()
-        start = time.time()
-        try:
-            resp = fn(*args, **kwargs, trace_id=trace_id, span_id=span_id)
-            status = "success"
-        except Exception as e:
-            resp = None
-            status = "error"
-            raise
-        finally:
-            latency = (time.time() - start)*1000
-            REQUEST_LATENCY.observe(latency/1000.0)
-            REQUEST_COUNT.labels(status=status).inc()
-            log_event(trace_id, span_id, parent_span_id, role="assistant", message=f"call to {fn.__name__}", latency_ms=latency, tokens_used=getattr(resp, "usage", {}).get("total_tokens", None) if resp else None)
-        return resp
-    return wrapper
+    if extra:
+        evento.update(extra)
+
+    logger.info(json.dumps(evento))
+    return trace_id
+
+
+def registrar_solicitud(endpoint: str, estado: str, latencia_s: float):
+    """
+    Registra métricas de una solicitud.
+    """
+    SOLICITUDES_TOTAL.labels(metodo="chat", endpoint=endpoint, estado=estado).inc()
+    LATENCIA_SOLICITUD.labels(endpoint=endpoint).observe(latencia_s)
+
+
+def registrar_tokens(rol: str, tokens: int):
+    """
+    Incrementa contador de tokens por rol.
+    """
+    TOKENS_USADOS.labels(rol=rol).inc(tokens)
+
+
+def registrar_error(endpoint: str, tipo_error: str):
+    """
+    Registra error clasificado por endpoint.
+    """
+    ERRORES.labels(endpoint=endpoint, tipo_error=tipo_error).inc()

@@ -9,10 +9,15 @@ from typing import List, Tuple, Optional
 from dotenv import load_dotenv
 from pythonjsonlogger import jsonlogger
 from openai import OpenAI
-from langsmith.wrappers import wrap_openai
 
 from memory import SessionMemory
 from planner_agent import orchestrate
+
+try:
+    from observability import start_metrics_server
+    _HAS_OBSERVABILITY = True
+except Exception:
+    _HAS_OBSERVABILITY = False
 
 load_dotenv()
 API_KEY = os.getenv("OPENAI_API_KEY")
@@ -24,6 +29,7 @@ if not API_KEY or not BASE_URL:
     raise RuntimeError("Faltan OPENAI_API_KEY u OPENAI_BASE_URL en .env")
 
 client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
+
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
@@ -39,6 +45,7 @@ if not logger.handlers:
     formatter = jsonlogger.JsonFormatter(fmt)
     fh.setFormatter(formatter)
     logger.addHandler(fh)
+
 
 def new_trace_id() -> str:
     return str(uuid.uuid4())
@@ -57,9 +64,7 @@ def log_event(
     tool: Optional[str] = None,
 ):
     """
-    tokens_used → si viene None, se fuerza a 0.
-    Esto es la causa de que antes vieras "0 tokens" siempre.
-    Ahora SIEMPRE se pasa tokens reales o estimados.
+    Graba un registro JSON. Mantiene tokens_used tal cual se reciba (None -> 0 en log).
     """
     rec = {
         "trace_id": trace_id,
@@ -69,7 +74,8 @@ def log_event(
         "message": message,
         "tool": tool,
         "latency_ms": latency_ms or 0,
-        "tokens_used": int(tokens_used) if tokens_used is not None else 0,
+        "tokens_used": int(tokens_used) if tokens_used is 
+        not None else 0,
     }
 
     logger.info(
@@ -83,7 +89,6 @@ def log_event(
             "tokens_used": rec["tokens_used"],
         },
     )
-
 
 def _tokenizar(texto: str) -> List[str]:
     return re.findall(r"[a-záéíóúñ0-9]+", (texto or "").lower())
@@ -113,9 +118,7 @@ def _puntuar_chunk(pregs: List[str], chunk: str) -> int:
     toks = _tokenizar(chunk)
     return sum(toks.count(t) for t in pregs)
 
-def recuperar_contexto(
-    pregunta: str, top_k: int = 3, domain_hint: str = ""
-) -> List[Tuple[str, str]]:
+def recuperar_contexto(pregunta: str, top_k: int = 3, domain_hint: str = "") -> List[Tuple[str, str]]:
     documentos = _cargar_documentos()
     if not documentos:
         return []
@@ -190,12 +193,13 @@ def _extract_text_from_choice(choice) -> str:
     except Exception:
         return str(choice)
 
-def _extract_tokens_used(resp) -> Optional[int]:
+def _extraer_tokens_de_resp(resp) -> Optional[int]:
     """
-    Intenta obtener tokens desde varias estructuras posibles.
+    Intenta extraer total_tokens de distintas estructuras. Retorna int o None.
+    Esto NO fuerza valores ni modifica mensajes; solo intenta leer el campo si existe.
     """
     try:
-        if hasattr(resp, "usage") and resp.usage:
+        if hasattr(resp, "usage") and getattr(resp, "usage", None):
             total = getattr(resp.usage, "total_tokens", None)
             if total is not None:
                 return int(total)
@@ -205,12 +209,13 @@ def _extract_tokens_used(resp) -> Optional[int]:
         d = resp.to_dict() if hasattr(resp, "to_dict") else resp
         if isinstance(d, dict):
             usage = d.get("usage")
-            if usage and usage.get("total_tokens"):
-                return int(usage["total_tokens"])
+            if usage:
+                t = usage.get("total_tokens") or usage.get("total")
+                if t:
+                    return int(t)
     except Exception:
         pass
     return None
-
 
 def consultar(pregunta: str, trace_id: Optional[str] = None, parent_span=None) -> str:
     trace_id = trace_id or new_trace_id()
@@ -255,9 +260,7 @@ def consultar(pregunta: str, trace_id: Optional[str] = None, parent_span=None) -
         if hasattr(resp, "choices") and resp.choices:
             text = _extract_text_from_choice(resp.choices[0])
 
-        tokens_used = _extract_tokens_used(resp)
-        if tokens_used is None:
-            tokens_used = max(20, len(text) // 4)
+        tokens_used = _extraer_tokens_de_resp(resp)
 
         log_event(
             trace_id,
@@ -284,6 +287,14 @@ def consultar(pregunta: str, trace_id: Optional[str] = None, parent_span=None) -
 
 if __name__ == "__main__":
     print("Asistente universitario listo")
+
+    if _HAS_OBSERVABILITY:
+        try:
+            start_metrics_server()
+            print("Servidor de métricas iniciado (observability.start_metrics_server).")
+        except Exception as e:
+            print("No se pudo iniciar servidor de métricas automáticamente:", e)
+
     mem = SessionMemory()
 
     try:
@@ -295,7 +306,6 @@ if __name__ == "__main__":
 
             trace_root = new_trace_id()
 
-    
             if pregunta.lower().startswith("simple "):
                 q = pregunta[7:].strip()
                 respuesta = consultar(q, trace_id=trace_root)
@@ -304,12 +314,22 @@ if __name__ == "__main__":
                 continue
 
             low = pregunta.lower()
-            if "vespertina" in low:
-                mem.remember("jornada", "vespertina")
-            if "diurna" in low:
-                mem.remember("jornada", "diurna")
+            try:
+                if "vespertina" in low:
+                    mem.remember("jornada", "vespertina")
+                if "diurna" in low:
+                    mem.remember("jornada", "diurna")
+            except Exception:
+                pass
 
-            mem.add_turn("user", pregunta)
+            try:
+                mem.add_turn("user", pregunta)
+            except Exception:
+                try:
+                    mem.remember("last_user", pregunta)
+                except Exception:
+                    pass
+
             span_orch = new_span_id()
             log_event(trace_root, span_orch, None, "system", "orchestrate_start")
 
@@ -326,7 +346,6 @@ if __name__ == "__main__":
                 )
                 latency_orch = (time.time() - start_orch) * 1000
 
-    
                 tokens_orch = None
                 respuesta_text = ""
 
@@ -336,12 +355,11 @@ if __name__ == "__main__":
                 else:
                     respuesta_text = str(respuesta)
 
-        
-                if not tokens_orch:
-                    tokens_orch = max(20, len(respuesta_text) // 4)
-                    respuesta_text = "(TOKEN_ESTIMADO) " + respuesta_text
-
-        
+                if tokens_orch is None and isinstance(respuesta, dict) and respuesta.get("raw_response"):
+                    try:
+                        tokens_orch = _extraer_tokens_de_resp(respuesta.get("raw_response"))
+                    except Exception:
+                        tokens_orch = None
                 log_event(
                     trace_root,
                     new_span_id(),
@@ -349,10 +367,17 @@ if __name__ == "__main__":
                     "assistant",
                     respuesta_text,
                     latency_ms=latency_orch,
-                    tokens_used=int(tokens_orch),
+                    tokens_used=tokens_orch,
                 )
 
-                mem.add_turn("assistant", respuesta_text)
+                try:
+                    mem.add_turn("assistant", respuesta_text)
+                except Exception:
+                    try:
+                        mem.remember("last_assistant", respuesta_text)
+                    except Exception:
+                        pass
+
                 print("\nPregunta:", pregunta)
                 print("Respuesta:", respuesta_text, "\n")
 

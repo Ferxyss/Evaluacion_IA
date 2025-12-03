@@ -1,5 +1,5 @@
 # 🎓 Asistente Universitario Inteligente  
-### Proyecto Unidad 3 – Ingeniería de Soluciones con IA (003D)
+### Proyecto Unidad 2 – Ingeniería de Soluciones con IA (003D)
 
 **Integrante:** Fernanda Paredes  
 **Profesor:** Giocrisrai Godoy Godoy  

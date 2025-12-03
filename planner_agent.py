@@ -73,8 +73,6 @@ def make_plan(question: str, domains: List[str]) -> List[str]:
             seen.add(s); plan.append(s)
     return plan
 
-
-# --- Orquestación ---
 ORCH_SYS = (
     "Eres el ORQUESTADOR. Coordina agentes especializados y entrega una respuesta final priorizada. "
     "Extrae de las respuestas parciales las fuentes citadas y añádelas al final como 'Fuentes: ...'."

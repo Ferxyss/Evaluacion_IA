@@ -1,61 +1,52 @@
 import streamlit as st
 import pandas as pd
-import json
-from datetime import datetime
-import matplotlib.pyplot as plt
-import os
+from pathlib import Path
+from tools.anomaly_detector import compute_percentiles, detect_latency_anomalies, load_logs
 
-LOG_PATH = os.getenv("LOG_PATH", "logs/agent.log")
+st.set_page_config(page_title="Dashboard Observabilidad - Agente Univ.", layout="wide")
+st.title("Dashboard Observabilidad - Asistente Universitario Inteligente")
+
+LOG_PATH = Path("logs/agent.log")
 
 @st.cache_data
-def load_logs(path):
-    rows = []
-    if not os.path.exists(path):
-        return pd.DataFrame(rows)
-    with open(path,'r',encoding='utf-8') as f:
-        for line in f:
-            try:
-                j = json.loads(line)
-                if isinstance(j.get("message"), str):
-                    try:
-                        inner = json.loads(j["message"])
-                        j.update(inner)
-                    except:
-                        pass
-                rows.append(j)
-            except:
-                continue
-    return pd.DataFrame(rows)
+def cargar_logs_df():
+    items = load_logs()
+    if not items:
+        return pd.DataFrame()
+    df = pd.DataFrame(items)
+    if 'latency_ms' in df.columns:
+        df['latency_ms'] = pd.to_numeric(df['latency_ms'], errors='coerce')
+    return df
 
-st.title("Dashboard Observabilidad - Agente Univ.")
+df = cargar_logs_df()
 
-df = load_logs(LOG_PATH)
-st.write("Registros cargados:", len(df))
-
-if len(df)==0:
-    st.info("No hay logs. Ejecuta el agente para generar registros.")
+if df.empty:
+    st.warning("No se detectaron logs en logs/agent.log. Ejecuta el agente primero.")
 else:
-    avg_latency = df["latency_ms"].dropna().astype(float).mean()
-    total_requests = len(df)
-    total_tokens = df["tokens_used"].dropna().astype(float).sum()
-    st.metric("Latencia media (ms)", round(avg_latency or 0,2))
-    st.metric("Total registros", total_requests)
-    st.metric("Tokens usados (total)", int(total_tokens or 0))
+    st.subheader("Métricas de latencia")
+    stats = compute_percentiles(df.to_dict('records'), field='latency_ms')
+    col1, col2, col3 = st.columns(3)
+    col1.metric("P50", f"{stats.get('p50', 0):.2f} ms")
+    col2.metric("P90", f"{stats.get('p90', 0):.2f} ms")
+    col3.metric("P95", f"{stats.get('p95', 0):.2f} ms")
 
+    st.markdown("**Histograma de latencia (clip a 20s para legibilidad)**")
+    st.bar_chart(df['latency_ms'].clip(upper=20000).fillna(0))
 
-    st.subheader("Distribución latencia (ms)")
-    fig, ax = plt.subplots()
-    df["latency_ms"].dropna().astype(float).hist(bins=30, ax=ax)
-    st.pyplot(fig)
+    st.subheader("Distribución por rol / estado")
+    if 'role' in df.columns:
+        st.dataframe(df.groupby('role')['latency_ms'].describe())
 
-    st.subheader("Eventos por role")
-    counts = df['role'].value_counts()
-    st.bar_chart(counts)
+    st.subheader("Anomalías detectadas (latencia > P95)")
+    threshold, anomalies = detect_latency_anomalies(pct=95)
+    st.write(f"Umbral P95: {threshold:.2f} ms — anomalías encontradas: {len(anomalies)}")
+    if anomalies:
+        anom_df = pd.DataFrame(anomalies)
+        st.dataframe(anom_df.sort_values(by='latency_ms', ascending=False).head(100))
 
-
-    st.subheader("Detalle por trace_id")
-    trace_ids = df['trace_id'].dropna().unique().tolist()
-    sel = st.selectbox("Selecciona trace_id", options=["--"]+trace_ids)
-    if sel and sel!="--":
-        sub = df[df['trace_id']==sel].sort_values('asctime')
-        st.dataframe(sub[['asctime','role','message','latency_ms','tokens_used','tool']])
+    st.subheader("Explorar interacciones por trace_id")
+    if 'trace_id' in df.columns:
+        trace_ids = df['trace_id'].unique().tolist()
+        sel = st.selectbox("Seleccionar trace_id", options=[""] + trace_ids)
+        if sel:
+            st.json(df[df['trace_id'] == sel].to_dict(orient='records'))
